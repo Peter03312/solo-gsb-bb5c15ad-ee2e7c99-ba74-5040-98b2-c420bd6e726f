@@ -1586,6 +1586,24 @@ def duration_audit(stations: list[Station],
 MERGE_TOLERANCE_MIN_SECONDS = 0
 MERGE_TOLERANCE_MAX_SECONDS = 120
 
+# 时刻差口径：统一采用与录入文本一致的「记录时刻差」——naive 时刻直接
+# 相减，不经过服务时区换算。datetime.timestamp() 会把 naive 时刻按服务
+# 本地时区解释，在采用夏令时的时区（如 America/New_York）会使秒差随
+# 部署时区漂移（春季拨快日凭空少 1 小时、秋季拨回日凭空多 1 小时），
+# 候选筛选、全局匹配费用与返回秒差必须全部绕开它。
+_MERGE_EPOCH = datetime(1970, 1, 1)
+
+
+def _wall_seconds(t: datetime) -> int:
+    """naive 记录时刻距固定 naive 纪元的整秒数（文本时刻口径）。
+
+    两个记录时刻的该值之差恒等于 ``(t2 - t1).total_seconds()``，即按
+    录入文本表面时刻直接相减：服务即使运行在采用夏令时的时区，跨
+    春季拨快 / 秋季拨回日也不会增删一个小时；解析得到的时刻均为整秒，
+    取整无截断误差。
+    """
+    return int((t - _MERGE_EPOCH).total_seconds())
+
 
 @dataclass
 class MergePreview:
@@ -1761,7 +1779,10 @@ def _match_group(base: list[Swipe], imports: list[Swipe], tolerance: int
                  ) -> list[tuple[int, int, int]]:
     """单个（卡号, 站点, 方向）分组内的全局一对一匹配。
 
-    仅当 |基准时刻 − 导入时刻| ≤ tolerance（秒）时建立候选边。
+    仅当 |基准时刻 − 导入时刻| ≤ tolerance（秒）时建立候选边；时刻差按
+    **与录入文本一致的记录时刻差**（naive 时刻直接相减，见
+    _wall_seconds），不经过服务时区 / 夏令时换算，结果在任何部署时区
+    （含 America/New_York 这类跨夏令时日期）下都稳定。
     匹配目标依次为：
       1) 配对数最多（最大基数匹配）；
       2) 配对的总绝对时间差最小；
@@ -1781,10 +1802,12 @@ def _match_group(base: list[Swipe], imports: list[Swipe], tolerance: int
 
     # 候选边（原始下标, 秒级绝对时间差）：两侧按时刻排序后滑动窗口生成，
     # 只枚举 |Δt| ≤ tolerance 的对，避免对容差窗口外的记录对做无谓比较。
+    # 秒数统一走 _wall_seconds（记录时刻口径），不可用 datetime.timestamp()：
+    # 后者按服务本地时区解释 naive 时刻，夏令时切换日会把小时差算错。
     bo = sorted(range(n_all), key=lambda i: (base[i].t, base[i].line))
     xo = sorted(range(k_all), key=lambda j: (imports[j].t, imports[j].line))
-    bsec = [int(base[i].t.timestamp()) for i in bo]
-    xsec = [int(imports[j].t.timestamp()) for j in xo]
+    bsec = [_wall_seconds(base[i].t) for i in bo]
+    xsec = [_wall_seconds(imports[j].t) for j in xo]
     cand: dict[tuple[int, int], int] = {}
     lo = hi = 0
     for pos, bi in enumerate(bo):
@@ -1850,7 +1873,14 @@ def external_merge_preview(base_records: list[Swipe],
     - 以**已保存记录为基准**，待导入记录由 parse_records_text() 完成行格式
       解析（解析错误在调用方按原有定位错误返回）；
     - 仅当两条记录的**卡号、站点、进/出方向相同**且时间差不超过
-      tolerance 秒（0～120）时建立候选；
+      tolerance 秒（0～120，闭区间：恰为容差值仍算候选）时建立候选；
+    - **时刻差口径与录入文本一致**：两侧记录时刻都是 naive 文本时刻，
+      候选筛选、全局一对一匹配费用、返回的绝对秒差 / 有符号秒差统一
+      按表面记录时刻直接相减（见 _wall_seconds），不经过服务时区
+      换算；因此在采用夏令时的时区（如 America/New_York）下，跨
+      春季拨快日（01:59:30 与 03:00:00 按文本相差 60 分 30 秒）与
+      秋季拨回日（01:59:30 与 02:00:00 按文本相差 30 秒）的判定
+      均与普通日期一致，不随部署时区变化；
     - 按（卡号, 站点, 方向）分组各自做**全局一对一匹配**：先最大化配对数，
       再最小化配对的总绝对时间差，完全同分时以基准行号、导入行号稳定破同分；
     - 返回重复配对、仅基准记录、仅导入记录，以及去重后按时间排序的合并文本
@@ -1902,7 +1932,8 @@ def external_merge_preview(base_records: list[Swipe],
                 "base_time": b.time_text,
                 "import_time": x.time_text,
                 "abs_diff_seconds": diff,
-                "delta_seconds": int((x.t - b.t).total_seconds()),
+                # 与候选筛选 / 匹配费用同一口径（记录时刻差，导入 − 基准）
+                "delta_seconds": _wall_seconds(x.t) - _wall_seconds(b.t),
             })
             # 配对以基准行计入合并文本
             merged_entries.append((
